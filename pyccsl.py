@@ -629,6 +629,32 @@ def calculate_token_usage(transcript_entries):
     
     return totals
 
+def get_last_usage(transcript_entries):
+    """Get usage from the last transcript entry that has usage data.
+
+    The API reports cumulative context in each response, so the last
+    entry reflects the current context window size.
+
+    Args:
+        transcript_entries: List of parsed transcript entries
+
+    Returns:
+        Dict with usage data from the last entry, or empty dict
+    """
+    last_usage = None
+
+    for entry in transcript_entries:
+        usage = None
+        if entry.get("type") == "assistant" and "message" in entry:
+            usage = entry["message"].get("usage", {})
+        elif "toolUseResult" in entry and isinstance(entry["toolUseResult"], dict):
+            usage = entry["toolUseResult"].get("usage", {})
+
+        if usage and usage.get("input_tokens", 0) > 0:
+            last_usage = usage
+
+    return last_usage or {}
+
 def get_model_from_transcript(transcript_entries):
     """Extract the model ID from transcript entries.
     
@@ -1271,12 +1297,15 @@ def main():
         if debug:
             sys.stderr.write(f"DEBUG: Token totals: {token_totals}\n")
         
-        # Calculate tokens (all non-cached tokens: input + cache_creation + output)
-        # This represents the actual token usage that counts toward context
-        context_size = (token_totals.get("input_tokens", 0) + 
-                       token_totals.get("cache_creation_tokens", 0) + 
-                       token_totals.get("output_tokens", 0))
-        metrics["context_size"] = context_size  # Keep internal name for compatibility
+        # Context size = input side of the last API call (includes cache_read)
+        # Each API response reports the full context at that point, so only
+        # the last entry matters. Cache-read tokens still occupy context space.
+        # Output tokens are excluded since they haven't been fed back as input yet.
+        last_usage = get_last_usage(transcript_entries)
+        context_size = (last_usage.get("input_tokens", 0) +
+                       last_usage.get("cache_creation_input_tokens", 0) +
+                       last_usage.get("cache_read_input_tokens", 0))
+        metrics["context_size"] = context_size
         
         # Calculate cost using per-entry models
         cost = calculate_total_cost(transcript_entries, debug=debug)
