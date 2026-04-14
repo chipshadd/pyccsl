@@ -16,10 +16,10 @@ import sys
 import json
 import os
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import argparse
 
-__version__ = "0.9.36"
+__version__ = "0.9.37"
 
 # Pricing data embedded from https://docs.anthropic.com/en/docs/about-claude/pricing
 # All prices in USD per million tokens
@@ -239,6 +239,7 @@ FIELD_ORDER = [
     "perf-response-time",
     "perf-session-time",
     "perf-message-count",
+    "idle-time",
     "perf-all-metrics",
     "input",
     "output",
@@ -362,7 +363,15 @@ def parse_arguments():
         default=os.environ.get("PYCCSL_PERF_RESPONSE", "10,30,60"),
         help="Response time thresholds (green,yellow,orange) (default: 10,30,60)"
     )
-    
+
+    # Cache TTL for idle-time field
+    parser.add_argument(
+        "--cache-ttl",
+        type=int,
+        default=int(os.environ.get("PYCCSL_CACHE_TTL", "3600")),
+        help="Cache TTL in seconds for idle-time warning (default: 3600)"
+    )
+
     # Fields to display (positional argument)
     parser.add_argument(
         "fields",
@@ -394,6 +403,8 @@ def parse_arguments():
         args.perf_cache = env_vars['PYCCSL_PERF_CACHE']
     if 'PYCCSL_PERF_RESPONSE' in env_vars:
         args.perf_response = env_vars['PYCCSL_PERF_RESPONSE']
+    if 'PYCCSL_CACHE_TTL' in env_vars:
+        args.cache_ttl = int(env_vars['PYCCSL_CACHE_TTL'])
     if 'PYCCSL_FIELDS' in env_vars:
         args.fields = env_vars['PYCCSL_FIELDS']
     
@@ -436,6 +447,7 @@ def parse_arguments():
         "debug": args.debug,
         "cache_thresholds": cache_thresholds,
         "response_thresholds": response_thresholds,
+        "cache_ttl": args.cache_ttl,
         "fields": fields
     }
 
@@ -984,7 +996,7 @@ def calculate_performance_metrics(transcript_entries, token_totals, debug=False)
     
     # Message count
     metrics["message_count"] = len(user_timestamps)
-    
+
     # Session duration
     all_timestamps = user_timestamps + assistant_timestamps
     if len(all_timestamps) >= 2:
@@ -993,7 +1005,17 @@ def calculate_performance_metrics(transcript_entries, token_totals, debug=False)
         metrics["session_duration"] = session_duration
     else:
         metrics["session_duration"] = 0.0
-    
+
+    # Idle time since last assistant response (proxy for cache freshness)
+    if assistant_timestamps:
+        last_api_ts = max(assistant_timestamps)
+        # Normalize to UTC if timezone-naive
+        if last_api_ts.tzinfo is None:
+            last_api_ts = last_api_ts.replace(tzinfo=timezone.utc)
+        now_utc = datetime.now(tz=timezone.utc)
+        idle = (now_utc - last_api_ts).total_seconds()
+        metrics["idle_seconds"] = max(0.0, idle)
+
     return metrics
 
 def format_duration(seconds):
@@ -1142,6 +1164,15 @@ def format_output(config, model_info, input_data, metrics=None):
                 field_content = f"Messages: {count}"
             else:
                 field_content = f"💬 {count}"
+        elif field == "idle-time" and "idle_seconds" in metrics:
+            idle = metrics["idle_seconds"]
+            time_str = format_duration(idle)
+            over_ttl = idle >= config["cache_ttl"]
+            if config["no_emoji"]:
+                prefix = "CACHE EXPIRED:" if over_ttl else "Idle:"
+            else:
+                prefix = "⚠️" if over_ttl else "💤"
+            field_content = f"{prefix} {time_str}"
         elif field == "perf-all-metrics":
             # Show all performance metrics together
             perf_parts = []
@@ -1157,6 +1188,15 @@ def format_output(config, model_info, input_data, metrics=None):
             if "message_count" in metrics:
                 count = metrics["message_count"]
                 perf_parts.append(f"💬 {count}" if not config["no_emoji"] else f"Messages: {count}")
+            if "idle_seconds" in metrics:
+                idle = metrics["idle_seconds"]
+                time_str = format_duration(idle)
+                over_ttl = idle >= config["cache_ttl"]
+                if config["no_emoji"]:
+                    perf_parts.append(f"CACHE EXPIRED: {time_str}" if over_ttl else f"Idle: {time_str}")
+                else:
+                    emoji = "⚠️" if over_ttl else "💤"
+                    perf_parts.append(f"{emoji} {time_str}")
             if perf_parts:
                 field_content = " ".join(perf_parts)
         
