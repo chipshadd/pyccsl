@@ -86,3 +86,67 @@ def test_idle_seconds_clamped_to_zero():
         metrics = pyccsl.calculate_performance_metrics(entries, token_totals)
 
     assert metrics["idle_seconds"] == 0.0
+
+
+def _base_config(fields, cache_ttl=3600, no_emoji=False):
+    """Helper: minimal config dict for format_output."""
+    return {
+        "theme": "none",
+        "style": "simple",
+        "numbers": "compact",
+        "no_emoji": no_emoji,
+        "debug": False,
+        "cache_thresholds": [95, 90, 75],
+        "response_thresholds": [10, 30, 60],
+        "cache_ttl": cache_ttl,
+        "fields": fields,
+    }
+
+
+def test_idle_time_field_under_ttl():
+    """idle-time shows 💤 emoji when under the TTL threshold."""
+    metrics = {"idle_seconds": 300.0}  # 5 minutes
+    config = _base_config(["idle-time"], cache_ttl=3600)
+    result = pyccsl.format_output(config, {}, {}, metrics)
+    assert "💤" in result
+    assert "⚠️" not in result
+    assert "5m" in result
+
+
+def test_idle_time_field_over_ttl():
+    """idle-time shows ⚠️ emoji when over the TTL threshold."""
+    metrics = {"idle_seconds": 3700.0}  # just over 1 hour
+    config = _base_config(["idle-time"], cache_ttl=3600)
+    result = pyccsl.format_output(config, {}, {}, metrics)
+    assert "⚠️" in result
+    assert "💤" not in result
+
+
+def test_idle_time_no_emoji_under_ttl():
+    """idle-time shows 'Idle:' prefix in no-emoji mode when under threshold."""
+    metrics = {"idle_seconds": 120.0}
+    config = _base_config(["idle-time"], cache_ttl=3600, no_emoji=True)
+    result = pyccsl.format_output(config, {}, {}, metrics)
+    assert "Idle:" in result
+    assert "CACHE EXPIRED:" not in result
+
+
+def test_idle_time_no_emoji_over_ttl():
+    """idle-time shows 'CACHE EXPIRED:' prefix in no-emoji mode when over threshold."""
+    metrics = {"idle_seconds": 7200.0}
+    config = _base_config(["idle-time"], cache_ttl=3600, no_emoji=True)
+    result = pyccsl.format_output(config, {}, {}, metrics)
+    assert "CACHE EXPIRED:" in result
+
+
+def test_idle_time_absent_when_no_metric():
+    """idle-time field produces no output when idle_seconds is not in metrics."""
+    metrics = {}
+    config = _base_config(["idle-time"])
+    result = pyccsl.format_output(config, {}, {}, metrics)
+    assert result == ""
+
+
+def test_idle_time_in_field_order():
+    """`idle-time` is present in FIELD_ORDER."""
+    assert "idle-time" in pyccsl.FIELD_ORDER

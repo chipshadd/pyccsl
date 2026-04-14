@@ -239,6 +239,7 @@ FIELD_ORDER = [
     "perf-response-time",
     "perf-session-time",
     "perf-message-count",
+    "idle-time",
     "perf-all-metrics",
     "input",
     "output",
@@ -1163,6 +1164,15 @@ def format_output(config, model_info, input_data, metrics=None):
                 field_content = f"Messages: {count}"
             else:
                 field_content = f"💬 {count}"
+        elif field == "idle-time" and "idle_seconds" in metrics:
+            idle = metrics["idle_seconds"]
+            time_str = format_duration(idle)
+            over_ttl = idle >= config["cache_ttl"]
+            if config["no_emoji"]:
+                prefix = "CACHE EXPIRED:" if over_ttl else "Idle:"
+            else:
+                prefix = "⚠️" if over_ttl else "💤"
+            field_content = f"{prefix} {time_str}"
         elif field == "perf-all-metrics":
             # Show all performance metrics together
             perf_parts = []
