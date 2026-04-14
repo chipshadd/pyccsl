@@ -362,7 +362,15 @@ def parse_arguments():
         default=os.environ.get("PYCCSL_PERF_RESPONSE", "10,30,60"),
         help="Response time thresholds (green,yellow,orange) (default: 10,30,60)"
     )
-    
+
+    # Cache TTL for idle-time field
+    parser.add_argument(
+        "--cache-ttl",
+        type=int,
+        default=int(os.environ.get("PYCCSL_CACHE_TTL", "3600")),
+        help="Cache TTL in seconds for idle-time warning (default: 3600)"
+    )
+
     # Fields to display (positional argument)
     parser.add_argument(
         "fields",
@@ -394,6 +402,8 @@ def parse_arguments():
         args.perf_cache = env_vars['PYCCSL_PERF_CACHE']
     if 'PYCCSL_PERF_RESPONSE' in env_vars:
         args.perf_response = env_vars['PYCCSL_PERF_RESPONSE']
+    if 'PYCCSL_CACHE_TTL' in env_vars:
+        args.cache_ttl = int(env_vars['PYCCSL_CACHE_TTL'])
     if 'PYCCSL_FIELDS' in env_vars:
         args.fields = env_vars['PYCCSL_FIELDS']
     
@@ -436,6 +446,7 @@ def parse_arguments():
         "debug": args.debug,
         "cache_thresholds": cache_thresholds,
         "response_thresholds": response_thresholds,
+        "cache_ttl": args.cache_ttl,
         "fields": fields
     }
 
