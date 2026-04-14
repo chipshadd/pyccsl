@@ -16,7 +16,7 @@ import sys
 import json
 import os
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import argparse
 
 __version__ = "0.9.36"
@@ -995,7 +995,7 @@ def calculate_performance_metrics(transcript_entries, token_totals, debug=False)
     
     # Message count
     metrics["message_count"] = len(user_timestamps)
-    
+
     # Session duration
     all_timestamps = user_timestamps + assistant_timestamps
     if len(all_timestamps) >= 2:
@@ -1004,7 +1004,17 @@ def calculate_performance_metrics(transcript_entries, token_totals, debug=False)
         metrics["session_duration"] = session_duration
     else:
         metrics["session_duration"] = 0.0
-    
+
+    # Idle time since last assistant response (proxy for cache freshness)
+    if assistant_timestamps:
+        last_api_ts = max(assistant_timestamps)
+        # Normalize to UTC if timezone-naive
+        if last_api_ts.tzinfo is None:
+            last_api_ts = last_api_ts.replace(tzinfo=timezone.utc)
+        now_utc = datetime.now(tz=timezone.utc)
+        idle = (now_utc - last_api_ts).total_seconds()
+        metrics["idle_seconds"] = max(0.0, idle)
+
     return metrics
 
 def format_duration(seconds):
