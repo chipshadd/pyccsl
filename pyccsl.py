@@ -1188,6 +1188,15 @@ def format_output(config, model_info, input_data, metrics=None):
             if "message_count" in metrics:
                 count = metrics["message_count"]
                 perf_parts.append(f"💬 {count}" if not config["no_emoji"] else f"Messages: {count}")
+            if "idle_seconds" in metrics:
+                idle = metrics["idle_seconds"]
+                time_str = format_duration(idle)
+                over_ttl = idle >= config["cache_ttl"]
+                if config["no_emoji"]:
+                    perf_parts.append(f"CACHE EXPIRED: {time_str}" if over_ttl else f"Idle: {time_str}")
+                else:
+                    emoji = "⚠️" if over_ttl else "💤"
+                    perf_parts.append(f"{emoji} {time_str}")
             if perf_parts:
                 field_content = " ".join(perf_parts)
         

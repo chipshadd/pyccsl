@@ -150,3 +150,31 @@ def test_idle_time_absent_when_no_metric():
 def test_idle_time_in_field_order():
     """`idle-time` is present in FIELD_ORDER."""
     assert "idle-time" in pyccsl.FIELD_ORDER
+
+
+def test_idle_time_in_perf_all_metrics():
+    """perf-all-metrics includes idle-time when idle_seconds is present."""
+    metrics = {
+        "cache_hit_rate": 0.92,
+        "avg_response_time": 5.0,
+        "session_duration": 600.0,
+        "message_count": 4,
+        "idle_seconds": 3700.0,  # over 1h TTL
+    }
+    config = _base_config(["perf-all-metrics"], cache_ttl=3600)
+    result = pyccsl.format_output(config, {}, {}, metrics)
+    assert "⚠️" in result
+
+
+def test_idle_time_absent_from_perf_all_metrics_when_no_metric():
+    """perf-all-metrics does not include idle-time when idle_seconds is absent."""
+    metrics = {
+        "cache_hit_rate": 0.92,
+        "avg_response_time": 5.0,
+        "session_duration": 600.0,
+        "message_count": 4,
+    }
+    config = _base_config(["perf-all-metrics"], cache_ttl=3600)
+    result = pyccsl.format_output(config, {}, {}, metrics)
+    assert "💤" not in result
+    assert "⚠️" not in result
