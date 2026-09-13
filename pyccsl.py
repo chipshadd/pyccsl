@@ -166,6 +166,19 @@ GRAY_50 = "\033[38;5;244m"  # 50% gray for badge
 
 # Powerline separator
 POWERLINE_RIGHT = "\ue0b0"  # Powerline right arrow (requires powerline font)
+POWERLINE_THIN = "\ue0b1"   # Powerline thin right arrow, divides the usage panel
+
+# Usage gauges
+GAUGE_CELLS = 5
+GAUGE_PARTIALS = "\u258f\u258e\u258d\u258c\u258b\u258a\u2589"  # 1/8 through 7/8 of a cell
+GAUGE_EMPTY = "\u2591"
+LEVEL_COLORS = [82, 220, 196]  # green, yellow, red
+PANEL_BG = 236
+PANEL_FG = 250
+PANEL_DIVIDER_FG = 244
+GAUGE_EMPTY_FG = 240
+USAGE_FIELDS = ["usage-5h", "usage-week", "usage-fable"]
+USAGE_LABELS = {"usage-5h": "5h", "usage-week": "wk", "usage-fable": "Fable"}
 
 def apply_color(text, fg_color=None, bg_color=None, bold=False):
     """Apply ANSI color codes to text.
@@ -243,7 +256,10 @@ FIELD_ORDER = [
     "input",
     "output",
     "tokens",
-    "cost"
+    "cost",
+    "usage-5h",
+    "usage-week",
+    "usage-fable"
 ]
 
 def parse_env_file(filepath):
@@ -1011,6 +1027,77 @@ def format_duration(seconds):
             days = hours / 24
             return f"{days:.0f}d"
 
+def render_gauge(percent):
+    """Render percent as a bar of GAUGE_CELLS cells with eighth-block precision."""
+    clamped = max(0.0, min(100.0, float(percent)))
+    eighths = int(round(clamped / 100 * GAUGE_CELLS * 8))
+    if eighths == 0 and round(percent) >= 1:
+        eighths = 1
+    full, remainder = divmod(eighths, 8)
+    bar = "█" * full + (GAUGE_PARTIALS[remainder - 1] if remainder else "")
+    return bar + GAUGE_EMPTY * (GAUGE_CELLS - len(bar))
+
+def usage_level(percent):
+    """Return 0 (green), 1 (yellow) or 2 (red) for a usage percent."""
+    rounded = round(percent)
+    if rounded >= 90:
+        return 2
+    if rounded >= 75:
+        return 1
+    return 0
+
+def usage_percentages(input_data):
+    """Map usage-5h and usage-week to the stdin rate_limits percents, skipping missing windows."""
+    limits = input_data.get("rate_limits")
+    if not isinstance(limits, dict):
+        return {}
+    values = {}
+    for field, key in (("usage-5h", "five_hour"), ("usage-week", "seven_day")):
+        window = limits.get(key)
+        percent = window.get("used_percentage") if isinstance(window, dict) else None
+        if isinstance(percent, (int, float)):
+            values[field] = percent
+    return values
+
+def render_usage(label, percent, mode):
+    """Render one usage field as 'label gauge percent'.
+
+    mode is "none" (no color codes), "fg" (foreground colors, each run reset)
+    or "panel" (foreground-only codes that restore PANEL_FG, so the powerline
+    panel background survives).
+    """
+    gauge = render_gauge(percent)
+    filled = gauge.rstrip(GAUGE_EMPTY)
+    empty = gauge[len(filled):]
+    shown = f"{round(percent)}%"
+    if mode == "none":
+        return f"{label} {gauge} {shown}"
+    level_fg = LEVEL_COLORS[usage_level(percent)]
+
+    def paint(text, fg):
+        if not text:
+            return ""
+        if mode == "panel":
+            return f"\033[38;5;{fg}m{text}\033[38;5;{PANEL_FG}m"
+        return apply_color(text, fg_color=fg)
+
+    return f"{label} {paint(filled, level_fg)}{paint(empty, GAUGE_EMPTY_FG)} {paint(shown, level_fg)}"
+
+def group_joiner(bg_color):
+    """Separator between fields that share a powerline segment."""
+    if bg_color == PANEL_BG:
+        return f" \033[38;5;{PANEL_DIVIDER_FG}m{POWERLINE_THIN}\033[38;5;{PANEL_FG}m "
+    return " "
+
+def collect_cache_and_usage(input_data):
+    """Metrics for the usage fields. Never raises."""
+    metrics = {}
+    try:
+        metrics["usage"] = usage_percentages(input_data)
+    except Exception:
+        pass
+    return metrics
+
 def format_output(config, model_info, input_data, metrics=None):
     """Format the output based on selected fields and configuration.
     
@@ -1159,7 +1246,15 @@ def format_output(config, model_info, input_data, metrics=None):
                 perf_parts.append(f"💬 {count}" if not config["no_emoji"] else f"Messages: {count}")
             if perf_parts:
                 field_content = " ".join(perf_parts)
-        
+        elif field in USAGE_FIELDS and field in metrics.get("usage", {}):
+            if config["theme"] == "none":
+                mode = "none"
+            elif is_powerline:
+                mode = "panel"
+            else:
+                mode = "fg"
+            field_content = render_usage(USAGE_LABELS[field], metrics["usage"][field], mode)
+
         # Add field to output
         if field_content:
             if debug:
@@ -1171,10 +1266,12 @@ def format_output(config, model_info, input_data, metrics=None):
                 if field == "badge":
                     # Badge gets 50% gray background in powerline mode for better contrast
                     bg_color = 244  # 50% gray
+                elif field in USAGE_FIELDS:
+                    bg_color = PANEL_BG
                 segments.append((field_content, bg_color))
             else:
                 # Regular styling - apply foreground color
-                if field != "badge":
+                if field != "badge" and field not in USAGE_FIELDS:
                     color = get_field_color(field, theme_colors)
                     if color is not None:
                         field_content = apply_color(field_content, fg_color=color)
@@ -1198,13 +1295,13 @@ def format_output(config, model_info, input_data, metrics=None):
             else:
                 # New background, save previous group and start new one
                 if current_group:
-                    grouped_segments.append((" ".join(current_group), current_bg))
+                    grouped_segments.append((group_joiner(current_bg).join(current_group), current_bg))
                 current_group = [text]
                 current_bg = bg_color
         
         # Add final group
         if current_group:
-            grouped_segments.append((" ".join(current_group), current_bg))
+            grouped_segments.append((group_joiner(current_bg).join(current_group), current_bg))
         
         # Build result with grouped segments
         result = []
@@ -1212,9 +1309,10 @@ def format_output(config, model_info, input_data, metrics=None):
             if bg_color is None:
                 continue
             
-            # Apply background color and black text to segment
+            # Apply the segment's background and text colors
             # Badge is now treated the same as all other fields - simple and consistent
-            segment_text = apply_color(f" {text} ", fg_color=0, bg_color=bg_color)
+            text_fg = PANEL_FG if bg_color == PANEL_BG else 0
+            segment_text = apply_color(f" {text} ", fg_color=text_fg, bg_color=bg_color)
             result.append(segment_text)
             
             # Add separator if not last segment
@@ -1341,7 +1439,9 @@ def main():
     # Add git info to metrics
     if git_info["branch"]:
         metrics["git_info"] = git_info
-    
+
+    metrics.update(collect_cache_and_usage(input_data))
+
     # Format and output (pass metrics for field display)
     output = format_output(config, model_info, input_data, metrics)
     # Only add reset if colors were used (to prevent terminal color bleed)
