@@ -149,11 +149,11 @@ Fields are always displayed in this order, regardless of how they're specified:
 
 ### Cache and Usage Fields
 
-`cache` reads the `prompt_cache` object Claude Code passes on stdin, and `usage-5h` and `usage-week` read `rate_limits`. `cache` appears after a session's first response; the usage fields appear only on a Claude subscription.
+`cache` reads the `prompt_cache` object Claude Code passes on stdin, and `usage-5h` and `usage-week` read `rate_limits`. All four fields appear after a session's first response, and the usage fields, `usage-fable` included, only on a Claude subscription.
 
 `cache` turns yellow at 15 minutes left and red at 5, so a 5-minute cache starts red, and it stays red once the cache is cold. Each gauge turns yellow at 75% and red at 90%.
 
-Claude Code re-renders the status line on events such as a new message, so the countdown freezes while you are idle. Add `refreshInterval` (in seconds) to `~/.claude/settings.json` to re-render on a timer as well:
+Claude Code re-renders the status line on events such as a new message, and once when the cache expires, so between events the countdown stands still. Add `refreshInterval` (in seconds) to `~/.claude/settings.json` to re-render on a timer as well:
 
 ```json
 {

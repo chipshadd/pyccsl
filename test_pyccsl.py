@@ -73,6 +73,12 @@ class UsagePercentagesTests(unittest.TestCase):
                                 "seven_day": {"used_percentage": 51}}}
         self.assertEqual(pyccsl.usage_percentages(data), {"usage-week": 51})
 
+    def test_non_finite_or_bool_percent_is_skipped(self):
+        for percent in (float("nan"), float("inf"), True):
+            with self.subTest(percent=percent):
+                data = {"rate_limits": {"five_hour": {"used_percentage": percent}}}
+                self.assertEqual(pyccsl.usage_percentages(data), {})
+
 
 class RenderUsageTests(unittest.TestCase):
     def test_plain_mode(self):
@@ -209,6 +215,18 @@ class CacheFieldRenderTests(unittest.TestCase):
         metrics = pyccsl.collect_cache_and_usage(data, ["cache"], now)
         self.assertEqual(metrics["cache_state"], ("warm", 48))
         self.assertEqual(metrics["cache_recache_tokens"], 161136)
+
+    def test_collect_ignores_bool_recache_tokens(self):
+        now = 1_789_272_000
+        data = {"prompt_cache": {"warm": False, "recache_tokens_if_cold": True}}
+        metrics = pyccsl.collect_cache_and_usage(data, ["cache"], now)
+        self.assertEqual(metrics["cache_state"], ("cold", None))
+        self.assertIsNone(metrics["cache_recache_tokens"])
+
+    def test_collect_tolerates_huge_int_rate_limit(self):
+        data = {"rate_limits": {"five_hour": {"used_percentage": 10 ** 400}}}
+        metrics = pyccsl.collect_cache_and_usage(data, ["usage-5h"], 1_789_272_000)
+        self.assertNotIn("usage-5h", metrics["usage"])
 
 
 class CacheFieldWiringTests(unittest.TestCase):
@@ -517,12 +535,12 @@ class CollectFableTests(unittest.TestCase):
     def test_fresh_cache_shows_fable_without_fetching(self):
         pyccsl.write_json_atomic(pyccsl.usage_cache_path(), {
             "attempted_at": self.NOW - 10, "fetched_at": self.NOW - 10, "fable": {"percent": 11}})
-        metrics = pyccsl.collect_cache_and_usage({}, ["usage-fable"], self.NOW, self.spawn)
+        metrics = pyccsl.collect_cache_and_usage({"rate_limits": {}}, ["usage-fable"], self.NOW, self.spawn)
         self.assertEqual(metrics["usage"]["usage-fable"], 11)
         self.assertEqual(self.spawned, [])
 
     def test_empty_cache_starts_a_fetch(self):
-        metrics = pyccsl.collect_cache_and_usage({}, ["usage-fable"], self.NOW, self.spawn)
+        metrics = pyccsl.collect_cache_and_usage({"rate_limits": {}}, ["usage-fable"], self.NOW, self.spawn)
         self.assertEqual(self.spawned, [True])
         self.assertNotIn("usage-fable", metrics["usage"])
 
@@ -533,6 +551,13 @@ class CollectFableTests(unittest.TestCase):
         data = {"rate_limits": {"five_hour": {"used_percentage": 7}}}
         metrics = pyccsl.collect_cache_and_usage(data, ["usage-5h", "usage-fable"], self.NOW, raising_spawn)
         self.assertEqual(metrics["usage"], {"usage-5h": 7})
+
+    def test_no_rate_limits_hides_fable_and_does_not_fetch(self):
+        pyccsl.write_json_atomic(pyccsl.usage_cache_path(), {
+            "attempted_at": self.NOW - 10, "fetched_at": self.NOW - 10, "fable": {"percent": 11}})
+        metrics = pyccsl.collect_cache_and_usage({}, ["usage-fable"], self.NOW, self.spawn)
+        self.assertNotIn("usage-fable", metrics["usage"])
+        self.assertEqual(self.spawned, [])
 
 
 class EndToEndTests(unittest.TestCase):
@@ -580,11 +605,29 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(pyccsl.read_json_file(self.cache_path), seeded)
 
     def test_api_key_session_shows_no_usage(self):
-        seeded = self.seed_usage_cache(None)
+        seeded = self.seed_usage_cache(11)
         result = self.run_pyccsl({})
         self.assertEqual((result.returncode, result.stderr), (0, ""))
         self.assertEqual(strip_ansi(result.stdout), f" Opus 5 {pyccsl.POWERLINE_RIGHT}\n")
         self.assertEqual(pyccsl.read_json_file(self.cache_path), seeded)
+
+    def test_nan_percent_cannot_reach_the_renderer(self):
+        result = self.run_pyccsl({
+            "rate_limits": {"five_hour": {"used_percentage": float("nan")}},
+        })
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(strip_ansi(result.stdout), f" Opus 5 {pyccsl.POWERLINE_RIGHT}\n")
+
+
+class LazyImportTests(unittest.TestCase):
+    def test_urllib_and_tempfile_are_not_imported_at_module_load(self):
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, '%s'); import pyccsl; "
+             "print('urllib.request' in sys.modules, 'tempfile' in sys.modules)"
+             % os.path.dirname(PYCCSL)],
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.stdout.strip(), "False False")
 
 
 if __name__ == "__main__":

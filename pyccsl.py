@@ -18,8 +18,6 @@ import os
 import subprocess
 import time
 import math
-import tempfile
-import urllib.request
 from datetime import datetime, timedelta
 import argparse
 
@@ -1074,7 +1072,7 @@ def usage_percentages(input_data):
     for field, key in (("usage-5h", "five_hour"), ("usage-week", "seven_day")):
         window = limits.get(key)
         percent = window.get("used_percentage") if isinstance(window, dict) else None
-        if isinstance(percent, (int, float)):
+        if is_percent(percent):
             values[field] = percent
     return values
 
@@ -1169,6 +1167,7 @@ def read_json_file(path):
 
 def write_json_atomic(path, data):
     """Write data to path through a temp file and os.replace. Returns True on success."""
+    import tempfile
     try:
         directory = os.path.dirname(path)
         os.makedirs(directory, exist_ok=True)
@@ -1240,11 +1239,13 @@ def extract_fable(payload):
             return {"percent": percent, "resets_at": entry.get("resets_at")}
     return None
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
 def http_get_json(url, headers, timeout):
+    import urllib.request
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
     request = urllib.request.Request(url, headers=headers)
     with urllib.request.build_opener(NoRedirect).open(request, timeout=timeout) as response:
         return json.load(response)
@@ -1286,7 +1287,8 @@ def collect_cache_and_usage(input_data, fields, now, spawn=spawn_fetch):
         state = cache_state(prompt_cache, now)
         if state:
             metrics["cache_state"] = state
-            metrics["cache_recache_tokens"] = prompt_cache.get("recache_tokens_if_cold")
+            tokens = prompt_cache.get("recache_tokens_if_cold")
+            metrics["cache_recache_tokens"] = tokens if is_percent(tokens) else None
     except Exception:
         pass
     usage = {}
@@ -1294,7 +1296,7 @@ def collect_cache_and_usage(input_data, fields, now, spawn=spawn_fetch):
         usage = usage_percentages(input_data)
     except Exception:
         pass
-    if "usage-fable" in fields:
+    if "usage-fable" in fields and isinstance(input_data.get("rate_limits"), dict):
         try:
             path = usage_cache_path()
             cache = read_json_file(path)
