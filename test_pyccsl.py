@@ -136,5 +136,106 @@ class UsageModeTests(unittest.TestCase):
         self.assertNotIn("\x1b", self.render("powerline", "none"))
 
 
+class CacheStateTests(unittest.TestCase):
+    NOW = 1_789_272_000
+
+    def pc(self, seconds_left, warm=True):
+        return {"warm": warm, "expires_at": self.NOW + seconds_left, "recache_tokens_if_cold": 161136}
+
+    def test_hidden_without_prompt_cache(self):
+        self.assertIsNone(pyccsl.cache_state(None, self.NOW))
+
+    def test_hidden_when_warm_without_expiry(self):
+        self.assertIsNone(pyccsl.cache_state({"warm": True, "expires_at": None}, self.NOW))
+
+    def test_cold_when_not_warm(self):
+        self.assertEqual(pyccsl.cache_state({"warm": False, "expires_at": None}, self.NOW), ("cold", None))
+
+    def test_cold_when_expired(self):
+        self.assertEqual(pyccsl.cache_state(self.pc(0), self.NOW), ("cold", None))
+        self.assertEqual(pyccsl.cache_state(self.pc(-30), self.NOW), ("cold", None))
+
+    def test_levels_follow_displayed_minutes(self):
+        cases = [
+            (16 * 60, ("warm", 16)),
+            (15 * 60 + 59, ("low", 15)),
+            (6 * 60, ("low", 6)),
+            (5 * 60 + 59, ("critical", 5)),
+            (59, ("critical", 0)),
+        ]
+        for seconds_left, expected in cases:
+            with self.subTest(seconds_left=seconds_left):
+                self.assertEqual(pyccsl.cache_state(self.pc(seconds_left), self.NOW), expected)
+
+
+class CacheTextTests(unittest.TestCase):
+    def test_warm_text(self):
+        self.assertEqual(pyccsl.format_cache_text("warm", 48, 161136, False), "⏳ 48m left")
+
+    def test_last_minute(self):
+        self.assertEqual(pyccsl.format_cache_text("critical", 0, 161136, False), "⏳ <1m left")
+
+    def test_cold_text(self):
+        self.assertEqual(pyccsl.format_cache_text("cold", None, 161136, False), "🧊 cold · 161.1K re-ingest")
+        self.assertEqual(pyccsl.format_cache_text("cold", None, None, False), "🧊 cold")
+
+    def test_no_emoji(self):
+        self.assertEqual(pyccsl.format_cache_text("warm", 48, 161136, True), "Cache: 48m left")
+        self.assertEqual(pyccsl.format_cache_text("cold", None, 161136, True), "Cache: cold (161.1K)")
+        self.assertEqual(pyccsl.format_cache_text("cold", None, None, True), "Cache: cold")
+
+
+class CacheColorTests(unittest.TestCase):
+    def test_colors(self):
+        theme = pyccsl.THEMES["default"]
+        self.assertEqual(pyccsl.cache_color("warm", theme), theme["input"])
+        self.assertEqual(pyccsl.cache_color("low", theme), 220)
+        self.assertEqual(pyccsl.cache_color("critical", theme), 196)
+        self.assertEqual(pyccsl.cache_color("cold", theme), 196)
+        self.assertIsNone(pyccsl.cache_color("cold", pyccsl.THEMES["none"]))
+
+
+class CacheFieldRenderTests(unittest.TestCase):
+    def test_powerline_segment_uses_level_background(self):
+        config = render_config(fields=["cache"])
+        metrics = {"cache_state": ("low", 12), "cache_recache_tokens": 161136}
+        out = pyccsl.format_output(config, {"display_name": "Opus 5"}, {"cwd": "/tmp"}, metrics)
+        self.assertIn("\x1b[38;5;0;48;5;220m ⏳ 12m left ", out)
+
+    def test_collect_reads_prompt_cache(self):
+        now = 1_789_272_000
+        data = {"prompt_cache": {"warm": True, "expires_at": now + 48 * 60 + 30,
+                                 "recache_tokens_if_cold": 161136}}
+        metrics = pyccsl.collect_cache_and_usage(data, now)
+        self.assertEqual(metrics["cache_state"], ("warm", 48))
+        self.assertEqual(metrics["cache_recache_tokens"], 161136)
+
+
+class CacheFieldWiringTests(unittest.TestCase):
+    def test_hidden_when_warm_missing(self):
+        self.assertIsNone(pyccsl.cache_state({"expires_at": 1_789_272_600}, 1_789_272_000))
+
+    def test_hidden_until_first_response(self):
+        self.assertNotIn("cache_state", pyccsl.collect_cache_and_usage({}, 1_789_272_000))
+        config = render_config(fields=["model", "cache"])
+        out = pyccsl.format_output(config, {"display_name": "Opus 5"}, {"cwd": "/tmp"}, {})
+        self.assertEqual(strip_ansi(out), " Opus 5 " + pyccsl.POWERLINE_RIGHT)
+
+    def test_cold_no_emoji_segment(self):
+        config = render_config(fields=["cache"], no_emoji=True)
+        metrics = {"cache_state": ("cold", None), "cache_recache_tokens": 161136}
+        out = pyccsl.format_output(config, {}, {"cwd": "/tmp"}, metrics)
+        self.assertIn("\x1b[38;5;0;48;5;196m Cache: cold (161.1K) ", out)
+
+    def test_pipes_colors_cache_foreground_and_not_badge(self):
+        config = render_config(style="pipes", fields=["badge", "cache"], no_emoji=True)
+        metrics = {"badge": "B", "cache_state": ("critical", 3)}
+        out = pyccsl.format_output(config, {}, {"cwd": "/tmp"}, metrics)
+        self.assertEqual(out, "B | \x1b[38;5;196mCache: 3m left\x1b[0m")
+
+    def test_cache_follows_tokens(self):
+        self.assertEqual(pyccsl.FIELD_ORDER.index("cache"), pyccsl.FIELD_ORDER.index("tokens") + 1)
+
+
 if __name__ == "__main__":
     unittest.main()

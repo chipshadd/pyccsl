@@ -16,6 +16,7 @@ import sys
 import json
 import os
 import subprocess
+import time
 from datetime import datetime, timedelta
 import argparse
 
@@ -179,6 +180,8 @@ PANEL_DIVIDER_FG = 244
 GAUGE_EMPTY_FG = 240
 USAGE_FIELDS = ["usage-5h", "usage-week", "usage-fable"]
 USAGE_LABELS = {"usage-5h": "5h", "usage-week": "wk", "usage-fable": "Fable"}
+CACHE_LOW_MINUTES = 15
+CACHE_CRITICAL_MINUTES = 5
 
 def apply_color(text, fg_color=None, bg_color=None, bold=False):
     """Apply ANSI color codes to text.
@@ -256,6 +259,7 @@ FIELD_ORDER = [
     "input",
     "output",
     "tokens",
+    "cache",
     "cost",
     "usage-5h",
     "usage-week",
@@ -1089,9 +1093,59 @@ def group_joiner(bg_color):
         return f" \033[38;5;{PANEL_DIVIDER_FG}m{POWERLINE_THIN}\033[38;5;{PANEL_FG}m "
     return " "
 
-def collect_cache_and_usage(input_data):
-    """Metrics for the usage fields. Never raises."""
+def cache_state(prompt_cache, now):
+    """Return (state, minutes_left) for the cache field, or None to hide it.
+
+    state is "warm", "low", "critical" or "cold"; minutes_left is None when cold.
+    """
+    if not isinstance(prompt_cache, dict):
+        return None
+    if prompt_cache.get("warm") is False:
+        return ("cold", None)
+    expires_at = prompt_cache.get("expires_at")
+    if not prompt_cache.get("warm") or not isinstance(expires_at, (int, float)):
+        return None
+    remaining = expires_at - now
+    if remaining <= 0:
+        return ("cold", None)
+    minutes = int(remaining // 60)
+    if minutes <= CACHE_CRITICAL_MINUTES:
+        return ("critical", minutes)
+    if minutes <= CACHE_LOW_MINUTES:
+        return ("low", minutes)
+    return ("warm", minutes)
+
+def format_cache_text(state, minutes, recache_tokens, no_emoji):
+    """Text for the cache field."""
+    if state == "cold":
+        tokens = format_number(recache_tokens, "compact") if isinstance(recache_tokens, (int, float)) else None
+        if no_emoji:
+            return f"Cache: cold ({tokens})" if tokens else "Cache: cold"
+        return f"🧊 cold · {tokens} re-ingest" if tokens else "🧊 cold"
+    left = "<1m" if minutes == 0 else f"{minutes}m"
+    return f"Cache: {left} left" if no_emoji else f"⏳ {left} left"
+
+def cache_color(state, theme_colors):
+    """The theme's input color while warm, then yellow, then red."""
+    if not theme_colors:
+        return None
+    if state == "warm":
+        return theme_colors.get("input")
+    if state == "low":
+        return LEVEL_COLORS[1]
+    return LEVEL_COLORS[2]
+
+def collect_cache_and_usage(input_data, now):
+    """Metrics for the cache and usage fields. Never raises."""
     metrics = {}
+    try:
+        prompt_cache = input_data.get("prompt_cache")
+        state = cache_state(prompt_cache, now)
+        if state:
+            metrics["cache_state"] = state
+            metrics["cache_recache_tokens"] = prompt_cache.get("recache_tokens_if_cold")
+    except Exception:
+        pass
     try:
         metrics["usage"] = usage_percentages(input_data)
     except Exception:
@@ -1246,6 +1300,9 @@ def format_output(config, model_info, input_data, metrics=None):
                 perf_parts.append(f"💬 {count}" if not config["no_emoji"] else f"Messages: {count}")
             if perf_parts:
                 field_content = " ".join(perf_parts)
+        elif field == "cache" and "cache_state" in metrics:
+            state, minutes = metrics["cache_state"]
+            field_content = format_cache_text(state, minutes, metrics.get("cache_recache_tokens"), config["no_emoji"])
         elif field in USAGE_FIELDS and field in metrics.get("usage", {}):
             if config["theme"] == "none":
                 mode = "none"
@@ -1266,15 +1323,21 @@ def format_output(config, model_info, input_data, metrics=None):
                 if field == "badge":
                     # Badge gets 50% gray background in powerline mode for better contrast
                     bg_color = 244  # 50% gray
+                elif field == "cache":
+                    bg_color = cache_color(metrics["cache_state"][0], theme_colors)
                 elif field in USAGE_FIELDS:
                     bg_color = PANEL_BG
                 segments.append((field_content, bg_color))
             else:
                 # Regular styling - apply foreground color
-                if field != "badge" and field not in USAGE_FIELDS:
+                if field == "cache":
+                    color = cache_color(metrics["cache_state"][0], theme_colors)
+                elif field != "badge" and field not in USAGE_FIELDS:
                     color = get_field_color(field, theme_colors)
-                    if color is not None:
-                        field_content = apply_color(field_content, fg_color=color)
+                else:
+                    color = None
+                if color is not None:
+                    field_content = apply_color(field_content, fg_color=color)
                 output_parts.append(field_content)
         else:
             if debug:
@@ -1440,7 +1503,7 @@ def main():
     if git_info["branch"]:
         metrics["git_info"] = git_info
 
-    metrics.update(collect_cache_and_usage(input_data))
+    metrics.update(collect_cache_and_usage(input_data, int(time.time())))
 
     # Format and output (pass metrics for field display)
     output = format_output(config, model_info, input_data, metrics)
