@@ -17,6 +17,9 @@ import json
 import os
 import subprocess
 import time
+import math
+import tempfile
+import urllib.request
 from datetime import datetime, timedelta
 import argparse
 
@@ -182,6 +185,10 @@ USAGE_FIELDS = ["usage-5h", "usage-week", "usage-fable"]
 USAGE_LABELS = {"usage-5h": "5h", "usage-week": "wk", "usage-fable": "Fable"}
 CACHE_LOW_MINUTES = 15
 CACHE_CRITICAL_MINUTES = 5
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+USAGE_RETRY_SECONDS = 300
+USAGE_STALE_SECONDS = 1800
+USAGE_TIMEOUT_SECONDS = 5
 
 def apply_color(text, fg_color=None, bg_color=None, bold=False):
     """Apply ANSI color codes to text.
@@ -383,6 +390,13 @@ def parse_arguments():
         help="Response time thresholds (green,yellow,orange) (default: 10,30,60)"
     )
     
+    # Background usage fetch, launched by the status line itself
+    parser.add_argument(
+        "--fetch-usage",
+        action="store_true",
+        help=argparse.SUPPRESS
+    )
+
     # Fields to display (positional argument)
     parser.add_argument(
         "fields",
@@ -456,7 +470,8 @@ def parse_arguments():
         "debug": args.debug,
         "cache_thresholds": cache_thresholds,
         "response_thresholds": response_thresholds,
-        "fields": fields
+        "fields": fields,
+        "fetch_usage": args.fetch_usage
     }
 
 def read_input():
@@ -1135,7 +1150,135 @@ def cache_color(state, theme_colors):
         return LEVEL_COLORS[1]
     return LEVEL_COLORS[2]
 
-def collect_cache_and_usage(input_data, now):
+def usage_cache_path():
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "pyccsl", "usage.json")
+
+def credentials_path():
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    return os.path.join(base, ".credentials.json")
+
+def read_json_file(path):
+    """Return the JSON object in path, or {} when it is missing or unreadable."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def write_json_atomic(path, data):
+    """Write data to path through a temp file and os.replace. Returns True on success."""
+    try:
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".usage-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp_path, path)
+        except Exception:
+            os.unlink(tmp_path)
+            raise
+        return True
+    except Exception:
+        return False
+
+def is_percent(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+def fable_from_cache(cache, now):
+    """The cached Fable percent, or None when it is missing or stale."""
+    fetched_at = cache.get("fetched_at")
+    fable = cache.get("fable")
+    if not isinstance(fetched_at, (int, float)) or not isinstance(fable, dict):
+        return None
+    if not 0 <= now - fetched_at <= USAGE_STALE_SECONDS:
+        return None
+    percent = fable.get("percent")
+    return percent if is_percent(percent) else None
+
+def spawn_fetch():
+    """Launch `pyccsl.py --fetch-usage` fully detached from the status line's pipes."""
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--fetch-usage"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+def maybe_start_fetch(cache_path, cache, now, spawn):
+    """Record an attempt and launch a fetch when the last attempt is stale.
+
+    Returns True when a fetch was launched. A failed write launches nothing.
+    """
+    attempted_at = cache.get("attempted_at")
+    if isinstance(attempted_at, (int, float)) and 0 <= now - attempted_at <= USAGE_RETRY_SECONDS:
+        return False
+    stamped = dict(cache)
+    stamped["attempted_at"] = now
+    if not write_json_atomic(cache_path, stamped):
+        return False
+    spawn()
+    return True
+
+def extract_fable(payload):
+    """The Fable weekly window from a usage response, as {"percent", "resets_at"}, or None."""
+    limits = payload.get("limits") if isinstance(payload, dict) else None
+    if not isinstance(limits, list):
+        return None
+    for entry in limits:
+        if not isinstance(entry, dict) or entry.get("kind") != "weekly_scoped":
+            continue
+        scope = entry.get("scope")
+        model = scope.get("model") if isinstance(scope, dict) else None
+        name = model.get("display_name") if isinstance(model, dict) else None
+        percent = entry.get("percent")
+        if isinstance(name, str) and name.lower() == "fable" and is_percent(percent):
+            return {"percent": percent, "resets_at": entry.get("resets_at")}
+    return None
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+def http_get_json(url, headers, timeout):
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.build_opener(NoRedirect).open(request, timeout=timeout) as response:
+        return json.load(response)
+
+def run_fetch_usage(cache_path, creds_path, now, get_json=http_get_json):
+    """Fetch the usage endpoint once and record the Fable window. Never raises.
+
+    Only the access token is read; refreshing would rotate the refresh token
+    and can log Claude Code out.
+    """
+    try:
+        oauth = read_json_file(creds_path).get("claudeAiOauth") or {}
+        token = oauth.get("accessToken")
+        expires_at_ms = oauth.get("expiresAt")
+        if not token:
+            return
+        if isinstance(expires_at_ms, (int, float)) and expires_at_ms / 1000 <= now:
+            return
+        payload = get_json(USAGE_URL, {
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "Content-Type": "application/json",
+        }, USAGE_TIMEOUT_SECONDS)
+        fable = extract_fable(payload)
+        if fable is None:
+            return
+        cache = read_json_file(cache_path)
+        cache["fetched_at"] = now
+        cache["fable"] = fable
+        write_json_atomic(cache_path, cache)
+    except Exception:
+        return
+
+def collect_cache_and_usage(input_data, fields, now, spawn=spawn_fetch):
     """Metrics for the cache and usage fields. Never raises."""
     metrics = {}
     try:
@@ -1146,10 +1289,22 @@ def collect_cache_and_usage(input_data, now):
             metrics["cache_recache_tokens"] = prompt_cache.get("recache_tokens_if_cold")
     except Exception:
         pass
+    usage = {}
     try:
-        metrics["usage"] = usage_percentages(input_data)
+        usage = usage_percentages(input_data)
     except Exception:
         pass
+    if "usage-fable" in fields:
+        try:
+            path = usage_cache_path()
+            cache = read_json_file(path)
+            fable = fable_from_cache(cache, now)
+            if fable is not None:
+                usage["usage-fable"] = fable
+            maybe_start_fetch(path, cache, now, spawn)
+        except Exception:
+            pass
+    metrics["usage"] = usage
     return metrics
 
 def format_output(config, model_info, input_data, metrics=None):
@@ -1415,7 +1570,11 @@ def main():
     # Parse arguments
     config = parse_arguments()
     debug = config.get("debug", False)
-    
+
+    if config["fetch_usage"]:
+        run_fetch_usage(usage_cache_path(), credentials_path(), int(time.time()))
+        return 0
+
     if debug:
         sys.stderr.write(f"DEBUG: Config: {config}\n")
     
@@ -1503,7 +1662,7 @@ def main():
     if git_info["branch"]:
         metrics["git_info"] = git_info
 
-    metrics.update(collect_cache_and_usage(input_data, int(time.time())))
+    metrics.update(collect_cache_and_usage(input_data, config["fields"], int(time.time())))
 
     # Format and output (pass metrics for field display)
     output = format_output(config, model_info, input_data, metrics)

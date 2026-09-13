@@ -206,7 +206,7 @@ class CacheFieldRenderTests(unittest.TestCase):
         now = 1_789_272_000
         data = {"prompt_cache": {"warm": True, "expires_at": now + 48 * 60 + 30,
                                  "recache_tokens_if_cold": 161136}}
-        metrics = pyccsl.collect_cache_and_usage(data, now)
+        metrics = pyccsl.collect_cache_and_usage(data, ["cache"], now)
         self.assertEqual(metrics["cache_state"], ("warm", 48))
         self.assertEqual(metrics["cache_recache_tokens"], 161136)
 
@@ -216,7 +216,7 @@ class CacheFieldWiringTests(unittest.TestCase):
         self.assertIsNone(pyccsl.cache_state({"expires_at": 1_789_272_600}, 1_789_272_000))
 
     def test_hidden_until_first_response(self):
-        self.assertNotIn("cache_state", pyccsl.collect_cache_and_usage({}, 1_789_272_000))
+        self.assertNotIn("cache_state", pyccsl.collect_cache_and_usage({}, ["cache"], 1_789_272_000))
         config = render_config(fields=["model", "cache"])
         out = pyccsl.format_output(config, {"display_name": "Opus 5"}, {"cwd": "/tmp"}, {})
         self.assertEqual(strip_ansi(out), " Opus 5 " + pyccsl.POWERLINE_RIGHT)
@@ -235,6 +235,304 @@ class CacheFieldWiringTests(unittest.TestCase):
 
     def test_cache_follows_tokens(self):
         self.assertEqual(pyccsl.FIELD_ORDER.index("cache"), pyccsl.FIELD_ORDER.index("tokens") + 1)
+
+
+FABLE_RESPONSE = {
+    "five_hour": {"utilization": 7.0, "resets_at": "2026-09-13T05:00:00.471846+00:00"},
+    "seven_day": {"utilization": 51.0, "resets_at": "2026-09-16T15:00:00.471899+00:00"},
+    "limits": [
+        {"kind": "session", "group": "session", "percent": 7,
+         "resets_at": "2026-09-13T05:00:00.471846+00:00", "scope": None},
+        {"kind": "weekly_all", "group": "weekly", "percent": 51,
+         "resets_at": "2026-09-16T15:00:00.471899+00:00", "scope": None},
+        {"kind": "weekly_scoped", "group": "weekly", "percent": 11,
+         "resets_at": "2026-09-16T15:00:00.472267+00:00",
+         "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None}},
+    ],
+}
+
+
+class ExtractFableTests(unittest.TestCase):
+    def test_real_response(self):
+        self.assertEqual(pyccsl.extract_fable(FABLE_RESPONSE),
+                         {"percent": 11, "resets_at": "2026-09-16T15:00:00.472267+00:00"})
+
+    def test_name_is_case_insensitive(self):
+        payload = json.loads(json.dumps(FABLE_RESPONSE))
+        payload["limits"][2]["scope"]["model"]["display_name"] = "FABLE"
+        self.assertEqual(pyccsl.extract_fable(payload)["percent"], 11)
+
+    def test_no_fable_entry(self):
+        self.assertIsNone(pyccsl.extract_fable({"limits": FABLE_RESPONSE["limits"][:2]}))
+
+    def test_malformed(self):
+        for payload in (None, [], {"limits": None},
+                        {"limits": ["x", {"kind": "weekly_scoped", "scope": "x"}]}):
+            with self.subTest(payload=payload):
+                self.assertIsNone(pyccsl.extract_fable(payload))
+
+    def test_nan_percent_is_treated_as_no_entry(self):
+        payload = json.loads(json.dumps(FABLE_RESPONSE))
+        payload["limits"][2]["percent"] = float("nan")
+        self.assertIsNone(pyccsl.extract_fable(payload))
+
+    def test_extra_entry_before_weekly_is_skipped(self):
+        payload = json.loads(json.dumps(FABLE_RESPONSE))
+        payload["limits"].insert(0, {"kind": "session_scoped", "percent": 99,
+                                     "scope": {"model": {"display_name": "Fable"}}})
+        self.assertEqual(pyccsl.extract_fable(payload)["percent"], 11)
+
+
+class UsageCacheTests(unittest.TestCase):
+    NOW = 1_789_272_000
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "pyccsl", "usage.json")
+        self.spawned = []
+
+    def spawn(self):
+        self.spawned.append(True)
+
+    def test_fresh_value_is_shown(self):
+        cache = {"fetched_at": self.NOW - 60, "fable": {"percent": 11}}
+        self.assertEqual(pyccsl.fable_from_cache(cache, self.NOW), 11)
+
+    def test_stale_or_missing_value_is_hidden(self):
+        stale = {"fetched_at": self.NOW - 1801, "fable": {"percent": 11}}
+        self.assertIsNone(pyccsl.fable_from_cache(stale, self.NOW))
+        self.assertIsNone(pyccsl.fable_from_cache({}, self.NOW))
+        self.assertIsNone(pyccsl.fable_from_cache({"fetched_at": self.NOW, "fable": None}, self.NOW))
+
+    def test_exact_stale_boundary_is_still_shown(self):
+        cache = {"fetched_at": self.NOW - 1800, "fable": {"percent": 11}}
+        self.assertEqual(pyccsl.fable_from_cache(cache, self.NOW), 11)
+
+    def test_non_finite_or_bool_percent_is_hidden(self):
+        for percent in (float("nan"), float("inf"), True):
+            with self.subTest(percent=percent):
+                cache = {"fetched_at": self.NOW, "fable": {"percent": percent}}
+                self.assertIsNone(pyccsl.fable_from_cache(cache, self.NOW))
+
+    def test_future_fetched_at_is_hidden(self):
+        cache = {"fetched_at": self.NOW + 60, "fable": {"percent": 11}}
+        self.assertIsNone(pyccsl.fable_from_cache(cache, self.NOW))
+
+    def test_future_attempted_at_spawns(self):
+        cache = {"attempted_at": self.NOW + 60}
+        self.assertTrue(pyccsl.maybe_start_fetch(self.path, cache, self.NOW, self.spawn))
+        self.assertEqual(self.spawned, [True])
+
+    def test_recent_attempt_starts_nothing(self):
+        cache = {"attempted_at": self.NOW - 300}
+        self.assertFalse(pyccsl.maybe_start_fetch(self.path, cache, self.NOW, self.spawn))
+        self.assertEqual(self.spawned, [])
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_stale_attempt_stamps_then_spawns(self):
+        cache = {"attempted_at": self.NOW - 301, "fetched_at": 5, "fable": {"percent": 11}}
+        self.assertTrue(pyccsl.maybe_start_fetch(self.path, cache, self.NOW, self.spawn))
+        self.assertEqual(self.spawned, [True])
+        self.assertEqual(pyccsl.read_json_file(self.path),
+                         {"attempted_at": self.NOW, "fetched_at": 5, "fable": {"percent": 11}})
+
+    def test_missing_file_spawns(self):
+        self.assertTrue(pyccsl.maybe_start_fetch(self.path, {}, self.NOW, self.spawn))
+        self.assertEqual(self.spawned, [True])
+
+    def test_failed_stamp_spawns_nothing(self):
+        blocker = os.path.join(self.tmp.name, "blocker")
+        open(blocker, "w").close()
+        path = os.path.join(blocker, "usage.json")
+        self.assertFalse(pyccsl.maybe_start_fetch(path, {}, self.NOW, self.spawn))
+        self.assertEqual(self.spawned, [])
+
+    def test_read_json_file_tolerates_garbage(self):
+        os.makedirs(os.path.dirname(self.path))
+        with open(self.path, "w") as f:
+            f.write("{not json")
+        self.assertEqual(pyccsl.read_json_file(self.path), {})
+
+    def test_write_json_atomic_failure_leaves_file_and_dir_untouched(self):
+        pyccsl.write_json_atomic(self.path, {"old": 1})
+        self.assertFalse(pyccsl.write_json_atomic(self.path, {"bad": object()}))
+        self.assertEqual(pyccsl.read_json_file(self.path), {"old": 1})
+        self.assertEqual(os.listdir(os.path.dirname(self.path)), ["usage.json"])
+
+
+class SpawnFetchTests(unittest.TestCase):
+    def test_child_is_fully_detached(self):
+        with mock.patch.object(pyccsl.subprocess, "Popen") as popen:
+            pyccsl.spawn_fetch()
+        args, kwargs = popen.call_args
+        self.assertEqual(args[0][1:], [os.path.abspath(pyccsl.__file__), "--fetch-usage"])
+        self.assertTrue(kwargs["start_new_session"])
+        for stream in ("stdin", "stdout", "stderr"):
+            self.assertIs(kwargs[stream], subprocess.DEVNULL)
+
+
+class NoRedirectTests(unittest.TestCase):
+    def test_redirect_is_not_followed_and_token_not_forwarded(self):
+        import http.server
+        import threading
+
+        b_hits = []
+
+        class HandlerB(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                b_hits.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                body = b"{}"
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        def stop(server, thread):
+            server.shutdown()
+            thread.join()
+            server.server_close()
+
+        server_b = http.server.HTTPServer(("127.0.0.1", 0), HandlerB)
+        thread_b = threading.Thread(target=server_b.serve_forever, daemon=True)
+        thread_b.start()
+        self.addCleanup(stop, server_b, thread_b)
+        b_url = f"http://127.0.0.1:{server_b.server_port}/"
+
+        class HandlerA(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", b_url)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server_a = http.server.HTTPServer(("127.0.0.1", 0), HandlerA)
+        thread_a = threading.Thread(target=server_a.serve_forever, daemon=True)
+        thread_a.start()
+        self.addCleanup(stop, server_a, thread_a)
+        a_url = f"http://127.0.0.1:{server_a.server_port}/"
+
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            pyccsl.http_get_json(a_url, {"Authorization": "Bearer t"}, 5)
+        self.assertEqual(ctx.exception.code, 302)
+        self.assertEqual(b_hits, [])
+
+
+class FetchUsageTests(unittest.TestCase):
+    NOW = 1_789_272_000
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cache_path = os.path.join(self.tmp.name, "cache", "usage.json")
+        self.creds_path = os.path.join(self.tmp.name, ".credentials.json")
+        self.calls = []
+
+    def write_creds(self, expires_in_seconds):
+        with open(self.creds_path, "w") as f:
+            json.dump({"claudeAiOauth": {"accessToken": "tok", "refreshToken": "never-used",
+                                         "expiresAt": (self.NOW + expires_in_seconds) * 1000}}, f)
+
+    def seed_cache(self):
+        pyccsl.write_json_atomic(self.cache_path, {
+            "attempted_at": self.NOW, "fetched_at": self.NOW - 600,
+            "fable": {"percent": 9, "resets_at": "old"}})
+
+    def fake_get(self, response=None, error=None):
+        def get(url, headers, timeout):
+            self.calls.append((url, headers, timeout))
+            if error:
+                raise error
+            return response
+        return get
+
+    def test_success_records_fable(self):
+        self.write_creds(3600)
+        self.seed_cache()
+        pyccsl.run_fetch_usage(self.cache_path, self.creds_path, self.NOW, self.fake_get(FABLE_RESPONSE))
+        url, headers, timeout = self.calls[0]
+        self.assertEqual(url, "https://api.anthropic.com/api/oauth/usage")
+        self.assertEqual(headers["Authorization"], "Bearer tok")
+        self.assertEqual(headers["anthropic-beta"], "oauth-2025-04-20")
+        self.assertEqual(timeout, 5)
+        self.assertEqual(pyccsl.read_json_file(self.cache_path), {
+            "attempted_at": self.NOW, "fetched_at": self.NOW,
+            "fable": {"percent": 11, "resets_at": "2026-09-16T15:00:00.472267+00:00"}})
+
+    def test_expired_token_sends_nothing(self):
+        self.write_creds(-1)
+        pyccsl.run_fetch_usage(self.cache_path, self.creds_path, self.NOW, self.fake_get(FABLE_RESPONSE))
+        self.assertEqual(self.calls, [])
+
+    def test_missing_credentials_send_nothing(self):
+        pyccsl.run_fetch_usage(self.cache_path, self.creds_path, self.NOW, self.fake_get(FABLE_RESPONSE))
+        self.assertEqual(self.calls, [])
+
+    def test_http_error_keeps_last_good_value(self):
+        self.write_creds(3600)
+        self.seed_cache()
+        error = urllib.error.HTTPError("https://api.anthropic.com/api/oauth/usage", 401, "Unauthorized", {}, None)
+        pyccsl.run_fetch_usage(self.cache_path, self.creds_path, self.NOW, self.fake_get(error=error))
+        cache = pyccsl.read_json_file(self.cache_path)
+        self.assertEqual((cache["fetched_at"], cache["fable"]), (self.NOW - 600, {"percent": 9, "resets_at": "old"}))
+
+    def test_response_without_fable_keeps_last_good_value(self):
+        self.write_creds(3600)
+        self.seed_cache()
+        pyccsl.run_fetch_usage(self.cache_path, self.creds_path, self.NOW, self.fake_get({"limits": []}))
+        self.assertEqual(pyccsl.read_json_file(self.cache_path)["fetched_at"], self.NOW - 600)
+
+    def test_fetch_usage_mode_exits_cleanly_without_credentials(self):
+        env = dict(os.environ, XDG_CACHE_HOME=self.tmp.name, CLAUDE_CONFIG_DIR=self.tmp.name)
+        result = subprocess.run([sys.executable, PYCCSL, "--fetch-usage"], stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, env=env, timeout=10)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+
+
+class CollectFableTests(unittest.TestCase):
+    NOW = 1_789_272_000
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = mock.patch.dict(os.environ, {"XDG_CACHE_HOME": self.tmp.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.spawned = []
+
+    def spawn(self):
+        self.spawned.append(True)
+
+    def test_no_fetch_without_the_field(self):
+        metrics = pyccsl.collect_cache_and_usage({}, ["cache", "usage-5h"], self.NOW, self.spawn)
+        self.assertEqual(self.spawned, [])
+        self.assertNotIn("usage-fable", metrics["usage"])
+
+    def test_fresh_cache_shows_fable_without_fetching(self):
+        pyccsl.write_json_atomic(pyccsl.usage_cache_path(), {
+            "attempted_at": self.NOW - 10, "fetched_at": self.NOW - 10, "fable": {"percent": 11}})
+        metrics = pyccsl.collect_cache_and_usage({}, ["usage-fable"], self.NOW, self.spawn)
+        self.assertEqual(metrics["usage"]["usage-fable"], 11)
+        self.assertEqual(self.spawned, [])
+
+    def test_empty_cache_starts_a_fetch(self):
+        metrics = pyccsl.collect_cache_and_usage({}, ["usage-fable"], self.NOW, self.spawn)
+        self.assertEqual(self.spawned, [True])
+        self.assertNotIn("usage-fable", metrics["usage"])
+
+    def test_spawn_failure_does_not_lose_other_usage_fields(self):
+        def raising_spawn():
+            raise OSError("boom")
+
+        data = {"rate_limits": {"five_hour": {"used_percentage": 7}}}
+        metrics = pyccsl.collect_cache_and_usage(data, ["usage-5h", "usage-fable"], self.NOW, raising_spawn)
+        self.assertEqual(metrics["usage"], {"usage-5h": 7})
 
 
 if __name__ == "__main__":
