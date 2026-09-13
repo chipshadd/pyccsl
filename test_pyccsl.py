@@ -535,5 +535,56 @@ class CollectFableTests(unittest.TestCase):
         self.assertEqual(metrics["usage"], {"usage-5h": 7})
 
 
+class EndToEndTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.now = int(time.time())
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith("PYCCSL_")}
+        self.env.update(XDG_CACHE_HOME=self.tmp.name, CLAUDE_CONFIG_DIR=self.tmp.name)
+
+    def seed_usage_cache(self, fable_percent):
+        cache = {"attempted_at": self.now, "fetched_at": self.now}
+        if fable_percent is not None:
+            cache["fable"] = {"percent": fable_percent, "resets_at": "2026-09-16T15:00:00+00:00"}
+        pyccsl.write_json_atomic(os.path.join(self.tmp.name, "pyccsl", "usage.json"), cache)
+
+    def run_pyccsl(self, extra):
+        payload = {"cwd": self.tmp.name,
+                   "transcript_path": os.path.join(self.tmp.name, "missing.jsonl"),
+                   "model": {"id": "claude-opus-5", "display_name": "Opus 5"}}
+        payload.update(extra)
+        return subprocess.run(
+            [sys.executable, PYCCSL, "--theme", "default", "--style", "powerline",
+             "cache,usage-5h,usage-week,usage-fable"],
+            input=json.dumps(payload), capture_output=True, text=True, env=self.env, timeout=20)
+
+    def test_subscription_session_shows_all_fields(self):
+        self.seed_usage_cache(11)
+        result = self.run_pyccsl({
+            "rate_limits": {
+                "five_hour": {"used_percentage": 7.000000000000001, "resets_at": self.now + 7000},
+                "seven_day": {"used_percentage": 51, "resets_at": self.now + 300000},
+            },
+            "prompt_cache": {"warm": True, "ttl": "1h", "expires_at": self.now + 48 * 60 + 30,
+                             "recache_tokens_if_cold": 161136},
+        })
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        text = strip_ansi(result.stdout)
+        for expected in ("⏳ 48m left", "5h ▍░░░░ 7%", "wk ██▌░░ 51%", "Fable ▌░░░░ 11%",
+                         pyccsl.POWERLINE_THIN):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, text)
+
+    def test_api_key_session_shows_no_usage(self):
+        self.seed_usage_cache(None)
+        result = self.run_pyccsl({})
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        text = strip_ansi(result.stdout)
+        for absent in ("5h", "wk", "Fable", "⏳", "🧊"):
+            with self.subTest(absent=absent):
+                self.assertNotIn(absent, text)
+
+
 if __name__ == "__main__":
     unittest.main()
