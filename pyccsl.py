@@ -237,7 +237,7 @@ def get_field_color(field, theme_colors):
         return theme_colors.get("git")
     elif field in ["model", "perf-cache-rate", "perf-response-time", 
                    "perf-session-time", "perf-message-count",
-                   "perf-all-metrics"]:
+                   "perf-all-metrics", "idle-time"]:
         return theme_colors.get("model")
     elif field in ["input"]:
         return theme_colors.get("input")

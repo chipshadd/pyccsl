@@ -630,5 +630,13 @@ class LazyImportTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "False False")
 
 
+class IdleTimeRenderTests(unittest.TestCase):
+    def test_idle_time_shares_the_model_segment_in_powerline(self):
+        config = render_config(fields=["model", "idle-time"])
+        config["cache_ttl"] = 3600
+        out = pyccsl.format_output(config, {"display_name": "Opus 5"}, {"cwd": "/tmp"}, {"idle_seconds": 34.4})
+        self.assertEqual(strip_ansi(out), f" Opus 5 💤 34.4s {pyccsl.POWERLINE_RIGHT}")
+
+
 if __name__ == "__main__":
     unittest.main()
