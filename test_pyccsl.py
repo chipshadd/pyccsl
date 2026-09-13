@@ -489,7 +489,7 @@ class FetchUsageTests(unittest.TestCase):
         self.assertEqual(pyccsl.read_json_file(self.cache_path)["fetched_at"], self.NOW - 600)
 
     def test_fetch_usage_mode_exits_cleanly_without_credentials(self):
-        env = dict(os.environ, XDG_CACHE_HOME=self.tmp.name, CLAUDE_CONFIG_DIR=self.tmp.name)
+        env = dict(os.environ, HOME=self.tmp.name, XDG_CACHE_HOME=self.tmp.name, CLAUDE_CONFIG_DIR=self.tmp.name)
         result = subprocess.run([sys.executable, PYCCSL, "--fetch-usage"], stdin=subprocess.DEVNULL,
                                 capture_output=True, text=True, env=env, timeout=10)
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
@@ -501,7 +501,7 @@ class CollectFableTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        patcher = mock.patch.dict(os.environ, {"XDG_CACHE_HOME": self.tmp.name})
+        patcher = mock.patch.dict(os.environ, {"HOME": self.tmp.name, "XDG_CACHE_HOME": self.tmp.name})
         patcher.start()
         self.addCleanup(patcher.stop)
         self.spawned = []
@@ -540,14 +540,17 @@ class EndToEndTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.now = int(time.time())
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith("PYCCSL_")}
-        self.env.update(XDG_CACHE_HOME=self.tmp.name, CLAUDE_CONFIG_DIR=self.tmp.name)
+        self.env = {k: v for k, v in os.environ.items()
+                    if not k.startswith("PYCCSL_") and not k.startswith("GIT_")}
+        self.env.update(HOME=self.tmp.name, XDG_CACHE_HOME=self.tmp.name, CLAUDE_CONFIG_DIR=self.tmp.name)
+        self.cache_path = os.path.join(self.tmp.name, "pyccsl", "usage.json")
 
     def seed_usage_cache(self, fable_percent):
-        cache = {"attempted_at": self.now, "fetched_at": self.now}
+        cache = {"attempted_at": self.now - 1, "fetched_at": self.now}
         if fable_percent is not None:
             cache["fable"] = {"percent": fable_percent, "resets_at": "2026-09-16T15:00:00+00:00"}
-        pyccsl.write_json_atomic(os.path.join(self.tmp.name, "pyccsl", "usage.json"), cache)
+        self.assertTrue(pyccsl.write_json_atomic(self.cache_path, cache))
+        return cache
 
     def run_pyccsl(self, extra):
         payload = {"cwd": self.tmp.name,
@@ -556,11 +559,11 @@ class EndToEndTests(unittest.TestCase):
         payload.update(extra)
         return subprocess.run(
             [sys.executable, PYCCSL, "--theme", "default", "--style", "powerline",
-             "cache,usage-5h,usage-week,usage-fable"],
+             "model,cache,usage-5h,usage-week,usage-fable"],
             input=json.dumps(payload), capture_output=True, text=True, env=self.env, timeout=20)
 
     def test_subscription_session_shows_all_fields(self):
-        self.seed_usage_cache(11)
+        seeded = self.seed_usage_cache(11)
         result = self.run_pyccsl({
             "rate_limits": {
                 "five_hour": {"used_percentage": 7.000000000000001, "resets_at": self.now + 7000},
@@ -570,20 +573,18 @@ class EndToEndTests(unittest.TestCase):
                              "recache_tokens_if_cold": 161136},
         })
         self.assertEqual((result.returncode, result.stderr), (0, ""))
-        text = strip_ansi(result.stdout)
-        for expected in ("⏳ 48m left", "5h ▍░░░░ 7%", "wk ██▌░░ 51%", "Fable ▌░░░░ 11%",
-                         pyccsl.POWERLINE_THIN):
-            with self.subTest(expected=expected):
-                self.assertIn(expected, text)
+        right, thin = pyccsl.POWERLINE_RIGHT, pyccsl.POWERLINE_THIN
+        expected = (f" Opus 5 {right} ⏳ 48m left {right} 5h ▍░░░░ 7% {thin} "
+                    f"wk ██▌░░ 51% {thin} Fable ▌░░░░ 11% {right}\n")
+        self.assertEqual(strip_ansi(result.stdout), expected)
+        self.assertEqual(pyccsl.read_json_file(self.cache_path), seeded)
 
     def test_api_key_session_shows_no_usage(self):
-        self.seed_usage_cache(None)
+        seeded = self.seed_usage_cache(None)
         result = self.run_pyccsl({})
         self.assertEqual((result.returncode, result.stderr), (0, ""))
-        text = strip_ansi(result.stdout)
-        for absent in ("5h", "wk", "Fable", "⏳", "🧊"):
-            with self.subTest(absent=absent):
-                self.assertNotIn(absent, text)
+        self.assertEqual(strip_ansi(result.stdout), f" Opus 5 {pyccsl.POWERLINE_RIGHT}\n")
+        self.assertEqual(pyccsl.read_json_file(self.cache_path), seeded)
 
 
 if __name__ == "__main__":
