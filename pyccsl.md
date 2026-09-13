@@ -141,7 +141,29 @@ Fields are always displayed in this order, regardless of how they're specified:
 | `input` | Input tokens as tuple: (base, cache_write, cache_read) | |
 | `output` | Output token count | |
 | `tokens` | Non-cached tokens (input + cache_write + output) | ✓ |
+| `cache` | Time left before the prompt cache goes cold (⏳ 48m left); once cold, the tokens the next turn re-ingests (🧊 cold · 161.1K re-ingest) | |
 | `cost` | Session cost in USD | ✓ |
+| `usage-5h` | 5-hour session usage gauge (5h ▍░░░░ 7%), Claude subscriptions only | |
+| `usage-week` | Weekly usage gauge (wk ██▌░░ 51%), Claude subscriptions only | |
+| `usage-fable` | Weekly Fable usage gauge (Fable ▌░░░░ 11%), fetched from the usage endpoint | |
+
+### Cache and Usage Fields
+
+`cache`, `usage-5h` and `usage-week` read the `prompt_cache` and `rate_limits` objects Claude Code passes on stdin. The usage fields appear only on a Claude subscription. `cache` turns yellow at 15 minutes left and red at 5, and stays red once the cache is cold. Each gauge turns yellow at 75% and red at 90%.
+
+Claude Code re-renders the status line only when something happens, so the countdown stands still while you are idle unless you add a timer to `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "python3 ~/.claude/pyccsl.py --env ~/.claude/pyccsl.env",
+    "refreshInterval": 60
+  }
+}
+```
+
+`usage-fable` is not on stdin. When it is selected, pyccsl launches a detached background fetch at most every 5 minutes. The fetch reads the Claude Code OAuth access token from `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR`), calls `https://api.anthropic.com/api/oauth/usage`, and caches the Fable percent in `~/.cache/pyccsl/usage.json` (or `$XDG_CACHE_HOME`). The cache file never holds the token, and pyccsl never refreshes it. If the token has expired or a fetch fails, the field keeps its last value for up to 30 minutes and then hides. On macOS, Claude Code keeps the token in the Keychain rather than in `.credentials.json`, so `usage-fable` stays hidden there.
 
 ## Examples
 

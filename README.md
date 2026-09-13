@@ -339,6 +339,7 @@ The env file is bash-compatible, so you can also source it: `source ~/.pyCCsl.en
 - No external dependencies - uses only Python standard library
 - Embedded Anthropic pricing data
 - Handles missing transcript files and non-git directories gracefully
+- One network call: the `usage-fable` field reads your Claude Code OAuth token and fetches `api.anthropic.com/api/oauth/usage` from a detached background process at most every 5 minutes (see the [User Guide](pyccsl.md#cache-and-usage-fields))
 
 ### Data Flow
 
