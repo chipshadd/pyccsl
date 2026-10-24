@@ -700,6 +700,31 @@ def get_last_usage(transcript_entries):
 
     return last_usage or {}
 
+def get_post_compact_tokens(transcript_entries):
+    """Return the compaction's postTokens estimate when no API call has followed it, else None.
+
+    postTokens counts only the summarized messages, so it reads lower than
+    /context, which also counts the system prompt and tools.
+    """
+    post_tokens = None
+
+    for entry in transcript_entries:
+        if entry.get("subtype") == "compact_boundary":
+            metadata = entry.get("compactMetadata")
+            value = metadata.get("postTokens") if isinstance(metadata, dict) else None
+            valid = isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            post_tokens = value if valid else None
+            continue
+        usage = None
+        if entry.get("type") == "assistant" and "message" in entry:
+            usage = entry["message"].get("usage", {})
+        elif "toolUseResult" in entry and isinstance(entry["toolUseResult"], dict):
+            usage = entry["toolUseResult"].get("usage", {})
+        if usage and usage.get("input_tokens", 0) > 0:
+            post_tokens = None
+
+    return post_tokens
+
 def get_model_from_transcript(transcript_entries):
     """Extract the model ID from transcript entries.
     
@@ -1419,7 +1444,8 @@ def format_output(config, model_info, input_data, metrics=None):
             field_content = f"{prefix} {format_number(metrics['output_tokens'], config['numbers'])}"
         elif field == "tokens" and "context_size" in metrics:
             prefix = "Tok:" if config["no_emoji"] else "⧉"
-            field_content = f"{prefix} {format_number(metrics['context_size'], config['numbers'])}"
+            estimate = "~" if metrics.get("context_estimated") else ""
+            field_content = f"{prefix} {estimate}{format_number(metrics['context_size'], config['numbers'])}"
         elif field == "cost":
             if "cost_formatted" in metrics:
                 field_content = metrics["cost_formatted"]
@@ -1668,7 +1694,11 @@ def main():
                        last_usage.get("cache_creation_input_tokens", 0) +
                        last_usage.get("cache_read_input_tokens", 0))
         metrics["context_size"] = context_size
-        
+        post_compact_tokens = get_post_compact_tokens(transcript_entries)
+        if post_compact_tokens is not None:
+            metrics["context_size"] = post_compact_tokens
+            metrics["context_estimated"] = True
+
         # Calculate cost using per-entry models
         cost = calculate_total_cost(transcript_entries, debug=debug)
         metrics["cost"] = cost

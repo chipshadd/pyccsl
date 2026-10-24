@@ -140,7 +140,7 @@ Fields are always displayed in this order, regardless of how they're specified:
 | `perf-all-metrics` | All performance metrics | |
 | `input` | Input tokens as tuple: (base, cache_write, cache_read) | |
 | `output` | Output token count | |
-| `tokens` | Non-cached tokens (input + cache_write + output) | ✓ |
+| `tokens` | Context size from the last API call (input + cache_write + cache_read); after `/compact` and before the next reply, the compaction's estimate (⧉ ~35,802), which reads lower than `/context` | ✓ |
 | `cache` | Time left before the prompt cache goes cold (⏳ 48m left); once cold, the tokens the next turn re-ingests (🧊 cold · 161.1K re-ingest) | |
 | `cost` | Session cost in USD | ✓ |
 | `usage-5h` | 5-hour session usage gauge (5h ▍░░░░ 7%), Claude subscriptions only | |

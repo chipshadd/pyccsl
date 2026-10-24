@@ -619,6 +619,43 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(strip_ansi(result.stdout), f" Opus 5 {pyccsl.POWERLINE_RIGHT}\n")
 
 
+class CompactionTokensTests(unittest.TestCase):
+    BOUNDARY = {"type": "system", "subtype": "compact_boundary",
+                "compactMetadata": {"trigger": "manual", "preTokens": 418993, "postTokens": 35802}}
+    SUMMARY = {"type": "user", "isCompactSummary": True, "message": {"role": "user", "content": "summary"}}
+
+    @staticmethod
+    def assistant(input_tokens, cache_read):
+        return {"type": "assistant", "message": {"model": "claude-opus-5", "usage": {
+            "input_tokens": input_tokens, "output_tokens": 10,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": cache_read}}}
+
+    def render(self, entries, *flags):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.jsonl")
+            with open(path, "w") as f:
+                f.writelines(json.dumps(e) + "\n" for e in entries)
+            result = subprocess.run(
+                [sys.executable, PYCCSL, "--theme", "none", "--style", "simple", "--numbers", "raw", *flags, "tokens"],
+                input=json.dumps({"cwd": tmp, "transcript_path": path}),
+                capture_output=True, text=True, timeout=20)
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        return result.stdout.strip()
+
+    def test_compaction_without_a_later_reply_shows_the_post_compact_estimate(self):
+        entries = [self.assistant(3, 418990), self.BOUNDARY, self.SUMMARY]
+        self.assertEqual(self.render(entries), "⧉ ~35802")
+        self.assertEqual(self.render(entries, "--no-emoji"), "Tok: ~35802")
+
+    def test_a_reply_after_compaction_shows_the_api_count(self):
+        entries = [self.assistant(3, 418990), self.BOUNDARY, self.SUMMARY, self.assistant(5, 51000)]
+        self.assertEqual(self.render(entries), "⧉ 51005")
+
+    def test_malformed_post_tokens_keeps_the_api_count(self):
+        boundary = {**self.BOUNDARY, "compactMetadata": {"postTokens": "35802"}}
+        self.assertEqual(self.render([self.assistant(3, 418990), boundary]), "⧉ 418993")
+
+
 class LazyImportTests(unittest.TestCase):
     def test_urllib_and_tempfile_are_not_imported_at_module_load(self):
         result = subprocess.run(
